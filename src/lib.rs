@@ -9,21 +9,24 @@ pub use std::ops::Generator;
 pub use std::ops::GeneratorState as State;
 use std::cell::Cell;
 
-pub trait Future: ?Move {
+#[derive(Default)]
+struct Immovable<'a>(PhantomData<fn(&'a ()) -> &'a ()>);
+
+pub trait Future<'a>: ?Move {
     type Return;
 
-    unsafe fn schedule(&mut self, callback: &mut FnMut(Self::Return));
+    fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return));
 }
 
-impl<'a, T: ?Move + Future> Future for &'a mut T {
+impl<'a, 'b, T: ?Move + Future<'a>> Future<'a> for &'b mut T {
     type Return = T::Return;
 
-    unsafe fn schedule(&mut self, callback: &mut FnMut(Self::Return)) {
+    fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return)) {
         (*self).schedule(callback)
     }
 }
 
-pub struct AsFuture<T: ?Move>(pub T);
+pub struct AsFuture<'a, T: ?Move>(Immovable<'a>, pub T);
 
 pub struct DelayAfterYield {
     operation: *mut FnMut(),
@@ -64,18 +67,20 @@ fn with_callback<F: FnOnce()>(callback: GeneratorResume, f: F) {
     GENERATOR_RESUME.with(|c| c.swap(&old_callback));
 }
 
-impl<T: Generator<Return = PhantomData<R>, Yield = DelayAfterYield> + ?Move, R> Future for AsFuture<T> where T::Return: Move {
+impl<'a, T: Generator<Return = PhantomData<R>, Yield = DelayAfterYield> + ?Move, R> Future<'a> for AsFuture<'a, T> where T::Return: Move {
     type Return = R;
 
-    unsafe fn schedule(&mut self, callback: &mut FnMut(Self::Return)) {
+    fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return)) {
         with_callback(GeneratorResume {
-                generator: self as *mut _ as *mut (),
-                resume: std::mem::transmute(<T as Generator>::resume as fn(&mut T) -> State<DelayAfterYield, PhantomData<R>>),
+                generator: &mut self.1 as *mut _ as *mut (),
+                resume: unsafe {
+                    std::mem::transmute(<T as Generator>::resume as fn(&mut T) -> State<DelayAfterYield, PhantomData<R>>)
+                },
         }, || {
             GENERATOR_RETURN.with(|r| {
                 r.set(Some(callback as *mut FnMut(Self::Return) as *mut FnMut()));
             });
-            process_generator_result(self.0.resume());
+            process_generator_result(self.1.resume());
         });
     }
 }
@@ -87,7 +92,7 @@ pub fn to_phanthom_data_and_callback<T>(_: &T, callback: *mut FnMut()) -> (Phant
 #[macro_export]
 macro_rules! async {
     ($($b:tt)*) => ({
-        $crate::AsFuture(static move || {
+        $crate::AsFuture(Immovable::default(), static move || {
             let return_callback = $crate::GENERATOR_RETURN.with(|c| c.get().unwrap());
             let mut inner = static move || {
                 // Force a generator by using `yield`
@@ -141,9 +146,61 @@ macro_rules! await {
     })
 }
 
-pub fn map<A: ?Move, F, U>(future: A, f: F) -> impl Future<Return = U> 
+pub fn map_e<'a, A: ?Move, F, U>(future: A, f: F) -> impl Future<'a, Return = U>
 where
-    A: Future,
+    A: Future<'a>,
+    F: FnOnce(A::Return) -> U,
+{
+    AsFuture(Immovable::default(), static move || {
+        let return_callback = GENERATOR_RETURN.with(|c| c.get().unwrap());
+        let mut inner = static move || {
+            // Force a generator by using `yield`
+            if false { unsafe { yield ::std::mem::uninitialized() } };
+
+            // START BODY
+
+            println!("in map");
+            f({
+                // START AWAIT
+
+                let mut result = None;
+                {
+                    let resume_callback = callback();
+                    let callback = &mut |r| {
+                        result = Some(r);
+                        resume_callback.call();
+                    };
+                    let mut future = future;
+
+                    let delay = &mut || {
+                        Future::schedule(&mut future, callback);
+                    };
+                    yield DelayAfterYield { operation: std::mem::transmute(delay as *mut FnMut()) };
+                }
+                result.unwrap()
+
+                // END AWAIT
+            })
+
+            // END BODY
+        };
+        let result = loop {
+            match Generator::resume(&mut inner) {
+                State::Complete(r) => break r,
+                State::Yielded(y) => yield y,
+            }
+        };
+        let (phanthom_result, return_callback) = to_phanthom_data_and_callback(&result, return_callback);
+        let return_callback = &mut *return_callback;
+        return_callback(result);
+        phanthom_result
+    })
+}
+
+/*
+pub fn map<'a, A: ?Move, F, U>(future: A, f: F) -> impl Future<'a, Return = U>
+where
+    A: Future<'a>,
     F: FnOnce(A::Return) -> U,
 {
     async! {
@@ -153,10 +210,10 @@ where
 }
 
 /// Returns the result of the first future to finish
-pub fn race<A: ?Move, B: ?Move, R>(mut a: A, mut b: B) -> impl Future<Return = R>
+pub fn race<'a, A: ?Move, B: ?Move, R>(mut a: A, mut b: B) -> impl Future<'a, Return = R>
 where
-    A: Future<Return = R>,
-    B: Future<Return = R>,
+    A: Future<'a, Return = R>,
+    B: Future<'a, Return = R>,
 {
     async! {
         let mut result = None;
@@ -183,10 +240,10 @@ where
 }
 
 /// Waits for two futures to complete
-pub fn join<A: ?Move, B: ?Move, RA, RB>(mut a: A, mut b: B) -> impl Future<Return = (RA, RB)>
+pub fn join<'a, A: ?Move, B: ?Move, RA, RB>(mut a: A, mut b: B) -> impl Future<'a, Return = (RA, RB)>
 where
-    A: Future<Return = RA>,
-    B: Future<Return = RB>,
+    A: Future<'a, Return = RA>,
+    B: Future<'a, Return = RB>,
 {
     async! {
         let mut ra = None;
@@ -221,3 +278,4 @@ where
         return (ra.unwrap(), rb.unwrap());
     }
 }
+*/
