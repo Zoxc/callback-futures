@@ -13,7 +13,7 @@ use std::cell::{RefCell, Cell};
 use std::boxed::FnBox;
 
 #[derive(Default)]
-struct Immovable<'a>(PhantomData<fn(&'a ()) -> &'a ()>);
+pub struct Immovable<'a>(PhantomData<fn(&'a ()) -> &'a ()>);
 
 pub unsafe trait Future<'a>: ?Move {
     type Return;
@@ -25,7 +25,7 @@ pub unsafe trait Future<'a>: ?Move {
     fn freshen(self) -> Self::Fresh;
 }
 
-struct Fresh<'a, T: ?Move>(Immovable<'a>, T);
+pub struct Fresh<'a, T: ?Move>(Immovable<'a>, T);
 
 unsafe impl<'a, T: Future<'static> + ?Move> Future<'a> for Fresh<'a, T> {
     type Return = T::Return;
@@ -44,11 +44,11 @@ unsafe impl<'a, T: Future<'static> + ?Move> Future<'a> for Fresh<'a, T> {
     }
 }
 
-fn freshen<'a, 'b, T: Future<'a> + ?Move>(f: T) -> Fresh<'b, T::Fresh> {
+pub fn freshen<'a, 'b, T: Future<'a> + ?Move>(f: T) -> Fresh<'b, T::Fresh> {
     Fresh(Immovable::default(), f.freshen())
 }
 
-pub struct AsFuture<'a, T: ?Move>(Immovable<'a>, pub T);
+pub struct AsFuture<'a, T: ?Move>(pub Immovable<'a>, pub T);
 
 pub struct DelayAfterYield {
     operation: Box<FnBox()>,
@@ -120,7 +120,7 @@ pub fn to_phanthom_data_and_callback<T>(_: &T, callback: *mut FnMut()) -> (Phant
 #[macro_export]
 macro_rules! async {
     ($($b:tt)*) => ({
-        $crate::AsFuture(Immovable::default(), static move || {
+        $crate::AsFuture($crate::Immovable::default(), static move || {
             let return_callback = $crate::GENERATOR_RETURN.with(|c| c.get().unwrap());
             let mut inner = static move || {
                 // Force a generator by using `yield`
@@ -180,7 +180,7 @@ macro_rules! await {
     })
 }
 
-pub fn map<'a, A: ?Move, F, U>(future: A, f: F) -> impl Future<'a, Return = U>
+pub fn map<'a, 'b, A: ?Move, F, U>(future: A, f: F) -> impl Future<'b, Return = U>
 where
     A: Future<'a>,
     F: FnOnce(A::Return) -> U,
@@ -192,10 +192,10 @@ where
 }
 
 /// Returns the result of the first future to finish
-pub fn race<'a, A: ?Move, B: ?Move, R>(a: A, b: B) -> impl Future<'a, Return = R>
+pub fn race<'a, 'b, 'c, A: ?Move, B: ?Move, R>(a: A, b: B) -> impl Future<'c, Return = R>
 where
     A: Future<'a, Return = R>,
-    B: Future<'a, Return = R>,
+    B: Future<'b, Return = R>,
 {
     async! {
         let result = RefCell::new(None);
@@ -234,10 +234,10 @@ where
 }
 
 /// Waits for two futures to complete
-pub fn join<'a, A: ?Move, B: ?Move, RA, RB>(a: A, b: B) -> impl Future<'a, Return = (RA, RB)>
+pub fn join<'a, 'b, 'c, A: ?Move, B: ?Move, RA, RB>(a: A, b: B) -> impl Future<'c, Return = (RA, RB)>
 where
     A: Future<'a, Return = RA>,
-    B: Future<'a, Return = RB>,
+    B: Future<'b, Return = RB>,
 {
     async! {
         let mut ra = None;
