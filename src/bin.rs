@@ -5,7 +5,8 @@
 #[macro_use]
 extern crate futures;
 
-use futures::{join, map, freshen, Future};
+use futures::{join, map, Future};
+use futures::pin::{StackPinned, Pin};
 
 fn main() {
     let a = async! {
@@ -16,5 +17,6 @@ fn main() {
         println!("in future b");
         3
     };
-    join(map(a, |r| r + 1), b).schedule(&mut |(a, b)| println!("{} {}", a, b));
+    let mut s = StackPinned::new(join(map(a, |r| r + 1), b));
+    Pin::from(&mut s).schedule(&mut |(a, b)| println!("{} {}", a, b));
 }

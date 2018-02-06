@@ -4,50 +4,78 @@
 #![feature(fn_traits)]
 #![feature(fnbox)]
 #![feature(clone_closures)]
+#![feature(arbitrary_self_types)]
 
 use std::marker::{PhantomData};
 pub use std::ops::Generator;
 pub use std::ops::GeneratorState as State;
 use std::cell::{RefCell, Cell};
 use std::boxed::FnBox;
+use pin::{Pin, StackPinned};
 
-#[derive(Default)]
-pub struct Immovable<'a>(PhantomData<fn(&'a ()) -> &'a ()>);
+pub mod pin {
+    use std::marker::PhantomData;
+    use std::ops::Deref;
+    
+    pub struct Pin<T>(T);
+    
+    impl<T> Deref for Pin<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.0
+        }
+    }
+    
+    impl<T> Pin<T> {
+        pub unsafe fn get_mut(this: &mut Self) -> &mut T {
+            &mut this.0
+        }
+    }
+    
+    impl<T: ?Sized> From<Box<T>> for Pin<Box<T>> {
+        fn from(x: Box<T>) -> Self {
+            Pin(x)
+        }
+    }
+    
+    impl<T: ?Sized> Pin<Box<T>> {
+        pub fn borrow(this: &mut Self) -> Pin<&mut T> {
+            Pin(&mut *this.0)
+        }
+    }
+    
+    pub struct StackPinned<'a, T: ?Sized>(PhantomData<&'a mut &'a ()>, T);
+    
+    impl<'a, T> StackPinned<'a, T> {
+        pub fn new(x: T) -> Self {
+            StackPinned(PhantomData, x)
+        }
+    }
+    
+    impl<'a, T: ?Sized> From<&'a mut StackPinned<'a, T>> for Pin<&'a mut T> {
+        fn from(x: &'a mut StackPinned<'a, T>) -> Self {
+            Pin(&mut x.1)
+        }
+    }
+    
+    impl<'a, T: ?Sized> Pin<&'a mut T> {
+        pub fn map<F: FnOnce(&'a mut T) -> &'a mut A, A: ?Sized>(this: Self, f: F) -> Pin<&'a mut A> {
+            Pin(f(this.0))
+        }
 
-pub unsafe trait Future<'a> {
+        pub fn reborrow<'b>(this: &'b mut Self) -> Pin<&'b mut T> {
+            Pin(this.0)
+        }
+    }
+}
+
+pub trait Future {
     type Return;
 
-    fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return));
-
-    type Fresh: Future<'static, Return=Self::Return>;
-
-    fn freshen(self) -> Self::Fresh;
+    fn schedule<'a>(self: Pin<&'a mut Self>, callback: &'a mut FnMut(Self::Return));
 }
 
-pub struct Fresh<'a, T>(pub Immovable<'a>, pub T);
-
-unsafe impl<'a, T: Future<'static>> Future<'a> for Fresh<'a, T> {
-    type Return = T::Return;
-
-    fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return)) {
-        let schedule_fn: fn(&'a T, &'a mut FnMut(Self::Return)) = unsafe {
-            std::mem::transmute(<T as Future<'static>>::schedule as usize)
-        };
-        schedule_fn(&self.1, callback);
-    }
-
-    type Fresh = Fresh<'static, T>;
-    
-    fn freshen(self) -> Self::Fresh {
-        Fresh(Immovable::default(), self.1)
-    }
-}
-
-pub fn freshen<'a, 'b, T: Future<'a>>(f: T) -> Fresh<'b, T::Fresh> {
-    Fresh(Immovable::default(), f.freshen())
-}
-
-pub struct AsFuture<'a, T>(pub Immovable<'a>, pub T);
+pub struct AsFuture<T>(pub T);
 
 pub struct DelayAfterYield {
     operation: Box<FnBox()>,
@@ -88,12 +116,13 @@ fn with_callback<F: FnOnce()>(callback: GeneratorResume, f: F) {
     GENERATOR_RESUME.with(|c| c.swap(&old_callback));
 }
 
-unsafe impl<'a, T: Generator<Return = PhantomData<R>, Yield = DelayAfterYield>, R> Future<'a> for AsFuture<'a, T> {
+impl<T: Generator<Return = PhantomData<R>, Yield = DelayAfterYield>, R> Future for AsFuture<T> {
     type Return = R;
 
-    fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return)) {
+    fn schedule<'a>(mut self: Pin<&'a mut Self>, callback: &'a mut FnMut(Self::Return)) {
+        let this = unsafe { &mut Pin::get_mut(&mut self).0 };
         with_callback(GeneratorResume {
-                generator: &mut self.1 as *mut _ as *mut (),
+                generator: this as *mut _ as *mut (),
                 resume: unsafe {
                     std::mem::transmute(<T as Generator>::resume as fn(&mut T) -> State<DelayAfterYield, PhantomData<R>>)
                 },
@@ -101,14 +130,8 @@ unsafe impl<'a, T: Generator<Return = PhantomData<R>, Yield = DelayAfterYield>, 
             GENERATOR_RETURN.with(|r| {
                 r.set(Some(callback as *mut FnMut(Self::Return) as *mut FnMut()));
             });
-            process_generator_result(self.1.resume());
+            process_generator_result(this.resume());
         });
-    }
-
-    type Fresh = AsFuture<'static, T>;
-
-    fn freshen(self) -> Self::Fresh {
-        AsFuture(Immovable::default(), self.1)
     }
 }
 
@@ -119,11 +142,11 @@ pub fn to_phanthom_data_and_callback<T>(_: &T, callback: *mut FnMut()) -> (Phant
 #[macro_export]
 macro_rules! async {
     ($($b:tt)*) => ({
-        $crate::Fresh($crate::Immovable::default(), $crate::AsFuture($crate::Immovable::default(), unsafe { static move || {
+        $crate::AsFuture(unsafe { static move || {
             let return_callback = $crate::GENERATOR_RETURN.with(|c| c.get().unwrap());
             let mut inner = static move || {
                 // Force a generator by using `yield`
-                if false { unsafe { yield ::std::mem::uninitialized() } };
+                if false { /*unsafe {*/ yield ::std::mem::uninitialized() /*}*/ };
                 $($b)*
             };
             let result = loop {
@@ -136,7 +159,7 @@ macro_rules! async {
             let return_callback = &mut *return_callback;
             return_callback(result);
             phanthom_result
-        }}))
+        }})
     })
 }
 
@@ -169,28 +192,28 @@ macro_rules! await {
                 result = Some(r);
                 resume_callback.call();
             };
-            let future = &mut freshen($e);
+            let future = &mut StackPinned::new($e);
             delay! {
                 let future = future;
-                $crate::Future::schedule(future, callback);
+                $crate::Future::schedule(Pin::from(future), callback);
             }
         }
         result.unwrap()
     })
 }
 
-fn test<'a, A, F, U>(future: A) 
+pub fn test<A, F, U>(future: A) 
 where
-    A: Future<'a>,
+    A: Future,
 {
-    let callback = &mut |r| ();
-    let future = &mut freshen(future);
-    future.schedule(callback);
+    let callback = &mut |_| ();
+    let mut future = StackPinned::new(future);
+    Pin::from(&mut future).schedule(callback);
 }
 
-pub fn map<'a, 'b, A, F, U>(future: A, f: F) -> impl Future<'b, Return = U>
+pub fn map<A, F, U>(future: A, f: F) -> impl Future<Return = U>
 where
-    A: Future<'a>,
+    A: Future,
     F: FnOnce(A::Return) -> U,
 {
     async! {
@@ -200,10 +223,10 @@ where
 }
 
 /// Returns the result of the first future to finish
-pub fn race<'a, 'b, 'c, A, B, R>(a: A, b: B) -> impl Future<'c, Return = R>
+pub fn race<A, B, R>(a: A, b: B) -> impl Future<Return = R>
 where
-    A: Future<'a, Return = R>,
-    B: Future<'b, Return = R>,
+    A: Future<Return = R>,
+    B: Future<Return = R>,
 {
     async! {
         let result = RefCell::new(None);
@@ -226,14 +249,14 @@ where
                 resume.call();
             };
 
-            let a = &mut freshen(a);
-            let b = &mut freshen(b);
+            let a = &mut StackPinned::new(a);
+            let b = &mut StackPinned::new(b);
 
-            delay!{
+            delay! {
                 let a = a;
                 let b = b;
-                a.schedule(&mut complete_a);
-                b.schedule(&mut complete_b);
+                Pin::from(a).schedule(&mut complete_a);
+                Pin::from(b).schedule(&mut complete_b);
             }
         }
 
@@ -242,15 +265,15 @@ where
 }
 
 /// Waits for two futures to complete
-pub fn join<'a, 'b, 'c, A, B, RA, RB>(a: A, b: B) -> Fresh<'c, impl Future<'static, Return = (RA, RB)>>
+pub fn join<A, B, RA, RB>(a: A, b: B) -> impl Future<Return = (RA, RB)>
 where
-    A: Future<'a, Return = RA>,
-    B: Future<'b, Return = RB>,
+    A: Future<Return = RA>,
+    B: Future<Return = RB>,
 {
     async! {
         let mut ra = None;
         let mut rb = None;
-        let count = Cell::new(0);
+        let count: Cell<usize> = Cell::new(0);
 
         let resume = callback();
 
@@ -271,14 +294,14 @@ where
                 }
             };
 
-            let a = &mut freshen(a);
-            let b = &mut freshen(b);
+            let a = &mut StackPinned::new(a);
+            let b = &mut StackPinned::new(b);
 
-            delay!{
+            delay! {
                 let a = a;
                 let b = b;
-                a.schedule(ca);
-                b.schedule(cb);
+                Pin::from(a).schedule(ca);
+                Pin::from(b).schedule(cb);
             }
         }
 
