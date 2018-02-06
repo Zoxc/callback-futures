@@ -16,5 +16,5 @@ fn main() {
         println!("in future b");
         3
     };
-    freshen(join(map(a, |r| r + 1), b)).schedule(&mut |(a, b)| println!("{} {}", a, b));
+    join(map(a, |r| r + 1), b).schedule(&mut |(a, b)| println!("{} {}", a, b));
 }

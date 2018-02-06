@@ -1,12 +1,11 @@
 #![feature(conservative_impl_trait)]
 #![feature(generators)]
-#![feature(immovable_types)]
 #![feature(generator_trait)]
 #![feature(fn_traits)]
 #![feature(fnbox)]
 #![feature(clone_closures)]
 
-use std::marker::{PhantomData, Move};
+use std::marker::{PhantomData};
 pub use std::ops::Generator;
 pub use std::ops::GeneratorState as State;
 use std::cell::{RefCell, Cell};
@@ -15,19 +14,19 @@ use std::boxed::FnBox;
 #[derive(Default)]
 pub struct Immovable<'a>(PhantomData<fn(&'a ()) -> &'a ()>);
 
-pub unsafe trait Future<'a>: ?Move {
+pub unsafe trait Future<'a> {
     type Return;
 
     fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return));
 
-    type Fresh: Future<'static, Return=Self::Return> + ?Move;
+    type Fresh: Future<'static, Return=Self::Return>;
 
     fn freshen(self) -> Self::Fresh;
 }
 
-pub struct Fresh<'a, T: ?Move>(Immovable<'a>, T);
+pub struct Fresh<'a, T>(pub Immovable<'a>, pub T);
 
-unsafe impl<'a, T: Future<'static> + ?Move> Future<'a> for Fresh<'a, T> {
+unsafe impl<'a, T: Future<'static>> Future<'a> for Fresh<'a, T> {
     type Return = T::Return;
 
     fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return)) {
@@ -44,11 +43,11 @@ unsafe impl<'a, T: Future<'static> + ?Move> Future<'a> for Fresh<'a, T> {
     }
 }
 
-pub fn freshen<'a, 'b, T: Future<'a> + ?Move>(f: T) -> Fresh<'b, T::Fresh> {
+pub fn freshen<'a, 'b, T: Future<'a>>(f: T) -> Fresh<'b, T::Fresh> {
     Fresh(Immovable::default(), f.freshen())
 }
 
-pub struct AsFuture<'a, T: ?Move>(pub Immovable<'a>, pub T);
+pub struct AsFuture<'a, T>(pub Immovable<'a>, pub T);
 
 pub struct DelayAfterYield {
     operation: Box<FnBox()>,
@@ -89,7 +88,7 @@ fn with_callback<F: FnOnce()>(callback: GeneratorResume, f: F) {
     GENERATOR_RESUME.with(|c| c.swap(&old_callback));
 }
 
-unsafe impl<'a, T: Generator<Return = PhantomData<R>, Yield = DelayAfterYield> + ?Move, R> Future<'a> for AsFuture<'a, T> where T::Return: Move {
+unsafe impl<'a, T: Generator<Return = PhantomData<R>, Yield = DelayAfterYield>, R> Future<'a> for AsFuture<'a, T> {
     type Return = R;
 
     fn schedule(&'a mut self, callback: &'a mut FnMut(Self::Return)) {
@@ -120,7 +119,7 @@ pub fn to_phanthom_data_and_callback<T>(_: &T, callback: *mut FnMut()) -> (Phant
 #[macro_export]
 macro_rules! async {
     ($($b:tt)*) => ({
-        $crate::AsFuture($crate::Immovable::default(), static move || {
+        $crate::Fresh($crate::Immovable::default(), $crate::AsFuture($crate::Immovable::default(), unsafe { static move || {
             let return_callback = $crate::GENERATOR_RETURN.with(|c| c.get().unwrap());
             let mut inner = static move || {
                 // Force a generator by using `yield`
@@ -137,7 +136,7 @@ macro_rules! async {
             let return_callback = &mut *return_callback;
             return_callback(result);
             phanthom_result
-        })
+        }}))
     })
 }
 
@@ -180,7 +179,16 @@ macro_rules! await {
     })
 }
 
-pub fn map<'a, 'b, A: ?Move, F, U>(future: A, f: F) -> impl Future<'b, Return = U>
+fn test<'a, A, F, U>(future: A) 
+where
+    A: Future<'a>,
+{
+    let callback = &mut |r| ();
+    let future = &mut freshen(future);
+    future.schedule(callback);
+}
+
+pub fn map<'a, 'b, A, F, U>(future: A, f: F) -> impl Future<'b, Return = U>
 where
     A: Future<'a>,
     F: FnOnce(A::Return) -> U,
@@ -192,7 +200,7 @@ where
 }
 
 /// Returns the result of the first future to finish
-pub fn race<'a, 'b, 'c, A: ?Move, B: ?Move, R>(a: A, b: B) -> impl Future<'c, Return = R>
+pub fn race<'a, 'b, 'c, A, B, R>(a: A, b: B) -> impl Future<'c, Return = R>
 where
     A: Future<'a, Return = R>,
     B: Future<'b, Return = R>,
@@ -234,7 +242,7 @@ where
 }
 
 /// Waits for two futures to complete
-pub fn join<'a, 'b, 'c, A: ?Move, B: ?Move, RA, RB>(a: A, b: B) -> impl Future<'c, Return = (RA, RB)>
+pub fn join<'a, 'b, 'c, A, B, RA, RB>(a: A, b: B) -> Fresh<'c, impl Future<'static, Return = (RA, RB)>>
 where
     A: Future<'a, Return = RA>,
     B: Future<'b, Return = RB>,
